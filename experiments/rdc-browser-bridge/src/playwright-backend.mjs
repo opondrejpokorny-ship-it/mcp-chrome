@@ -8,15 +8,22 @@ export function createPlaywrightReadOnlyBackend({page,allowedOrigins}){
   async snapshot(){
    const origin=current();
    if(page.isClosed()||!origin)throw new Error('Target outside trusted scope');
-   const frame=page.mainFrame();
-   let navigationObserved=false;
-   const onNavigation=(changedFrame)=>{if(changedFrame===frame)navigationObserved=true};
-   page.on('framenavigated',onNavigation);
+   const mainFrame=page.mainFrame();
+   const framesAllowed=()=>page.frames().every(frame=>{
+    if(frame===mainFrame)return current()===origin;
+    try{return allowed.has(new URL(frame.url()).origin)}catch{return false}
+   });
+   let frameChanged=false;
+   const onFrameChange=()=>{frameChanged=true};
+   for(const event of ['framenavigated','frameattached','framedetached'])page.on(event,onFrameChange);
    try{
+    if(!framesAllowed())throw new Error('Embedded frame outside trusted origin scope');
     const aria=await page.locator('body').ariaSnapshot({timeout:4000});
-    if(navigationObserved||current()!==origin)throw new Error('Target changed during observation');
+    if(frameChanged||current()!==origin||!framesAllowed())throw new Error('Target changed during observation');
     return {origin,aria};
-   }finally{page.off('framenavigated',onNavigation)}
+   }finally{
+    for(const event of ['framenavigated','frameattached','framedetached'])page.off(event,onFrameChange);
+   }
   }
  };
 }

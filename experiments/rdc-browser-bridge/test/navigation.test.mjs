@@ -8,6 +8,7 @@ class FakePage extends EventEmitter {
  url(){return this.location}
  isClosed(){return false}
  mainFrame(){return this.root}
+ frames(){return [this.root]}
  locator(selector){
   assert.equal(selector,'body');
   return {ariaSnapshot:async()=>{

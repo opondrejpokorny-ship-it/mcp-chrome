@@ -12,7 +12,7 @@ import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {createBridge} from '../src/server.mjs';
 import {createPlaywrightReadOnlyBackend} from '../src/playwright-backend.mjs';
-let browser,site,bridge,client;
+let browser,site,bridge,client,foreign;
 try{
  site=createServer((_,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});res.end('<!doctype html><html><body><h1>RDC pilot</h1><button>Safe check</button><input aria-label="Empty test field"></body></html>')});
  await new Promise(resolve=>site.listen(0,'127.0.0.1',resolve));
@@ -33,6 +33,16 @@ try{
  assert.match(state.aria,/Safe check/);
  assert.equal(state.origin,origin);
  console.log('REAL_BROWSER_MCP_STATUS_SNAPSHOT_GREEN');
+ foreign=createServer((_,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end('<!doctype html><p>UNTRUSTED_IFRAME_TEST_MARKER</p>')});
+ await new Promise(resolve=>foreign.listen(0,'127.0.0.1',resolve));
+ const foreignUrl='http://127.0.0.1:'+foreign.address().port+'/';
+ await page.evaluate(src=>{const frame=document.createElement('iframe');frame.src=src;document.body.append(frame)},foreignUrl);
+ await page.frameLocator('iframe').getByText('UNTRUSTED_IFRAME_TEST_MARKER').waitFor({timeout:4000});
+ const iframeDenied=await client.callTool({name:'rdc_browser_snapshot',arguments:{}});
+ assert.equal(iframeDenied.isError,true,'cross-origin iframe must block whole snapshot');
+ assert.doesNotMatch(JSON.stringify(iframeDenied),/UNTRUSTED_IFRAME_TEST_MARKER/);
+ console.log('CROSS_ORIGIN_IFRAME_SNAPSHOT_DENIED_GREEN');
+ await page.locator('iframe').evaluate(el=>el.remove());
  await page.goto('data:text/html,<p>HIDDEN_MARKER_PILOT</p>');
  const denied=await client.callTool({name:'rdc_browser_snapshot',arguments:{}});
  assert.equal(denied.isError,true);
@@ -40,4 +50,4 @@ try{
  console.log('CROSS_ORIGIN_SNAPSHOT_DENIED_GREEN');
  console.log('TOOLS='+tools.join(','));
 }catch(e){console.error('REAL_BROWSER_MCP_RED='+e.stack);process.exitCode=1}
-finally{await client?.close().catch(()=>{});await bridge?.close().catch(()=>{});await browser?.close().catch(()=>{});if(site)await new Promise(r=>site.close(r))}
+finally{await client?.close().catch(()=>{});await bridge?.close().catch(()=>{});await browser?.close().catch(()=>{});if(site)await new Promise(r=>site.close(r));if(foreign)await new Promise(r=>foreign.close(r))}
