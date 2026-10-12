@@ -8,13 +8,27 @@ const TOOL_NAMES=['rdc_browser_status','rdc_browser_snapshot'];
 const MAX_REQUEST_BYTES=16384;
 const MAX_SNAPSHOT_CHARS=8192;
 const MAX_ACTIVE_REQUESTS=8;
+const MAX_OPEN_SOCKETS=16;
 const AUTHORIZATION_TIMEOUT_MS=2000;
 const OBSERVATION_TIMEOUT_MS=5000;
 const loopback='127.0.0.1';
-async function withDeadline(work,ms){
+async function withDeadline(work,ms,parentSignal){
+ const controller=new AbortController();
+ const onParentAbort=()=>controller.abort();
+ if(parentSignal?.aborted)controller.abort();
+ else parentSignal?.addEventListener('abort',onParentAbort,{once:true});
  let timer;
- try{return await Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('operation_timeout')),ms)})])}
- finally{clearTimeout(timer)}
+ try{
+  return await Promise.race([
+   Promise.resolve().then(()=>{if(controller.signal.aborted)throw new Error('operation_cancelled');return work(controller.signal)}),
+   new Promise((_,reject)=>{
+    const abort=()=>reject(new Error('operation_cancelled'));
+    controller.signal.addEventListener('abort',abort,{once:true});
+    timer=setTimeout(()=>{reject(new Error('operation_timeout'));controller.abort(new Error('operation_timeout'))},ms);
+    if(controller.signal.aborted)abort();
+   })
+  ]);
+ }finally{clearTimeout(timer);parentSignal?.removeEventListener('abort',onParentAbort)}
 }
 
 function errorBody(response,code){
@@ -52,23 +66,29 @@ export async function createBridge({deviceId,token,backend,authorize=()=> 'DENY'
  if(!enabled||typeof enabled!=='object'||Array.isArray(enabled)||Object.keys(enabled).some(x=>!TOOL_NAMES.includes(x)||typeof enabled[x]!=='boolean'))throw new Error('Invalid browser capability configuration');
  const tools=Object.fromEntries(TOOL_NAMES.map(x=>[x,enabled[x]===true]));
  let snapshotBusy=false;
+ let snapshotUnhealthy=false;
  let activeRequests=0;
- function createMcp(){
+ const activeControllers=new Set();
+ const sockets=new Set();
+ function createMcp(requestSignal){
   const server=new McpServer({name:'rdc-browser-readonly-poc',version:'0.0.1'});
   async function gate(tool,handler){
    let result='DENY';
-   try{result=await withDeadline(()=>authorize(Object.freeze({deviceId,tool,action:'READ'})),AUTHORIZATION_TIMEOUT_MS)}catch{return denied()}
-   if(result!=='ALLOW')return denied();
-   try{return reply(await withDeadline(handler,OBSERVATION_TIMEOUT_MS))}catch{return {isError:true,content:[{type:'text',text:'Browser observation unavailable or outside allowed scope'}]}}
+   try{result=await withDeadline((signal)=>authorize(Object.freeze({deviceId,tool,action:'READ',signal})),AUTHORIZATION_TIMEOUT_MS,requestSignal)}catch{return denied()}
+   if(result!=='ALLOW'||requestSignal?.aborted)return denied();
+   try{return reply(await withDeadline(handler,OBSERVATION_TIMEOUT_MS,requestSignal))}catch(e){
+    if(tool==='rdc_browser_snapshot'&&['operation_timeout','operation_cancelled'].includes(e?.message))snapshotUnhealthy=true;
+    return {isError:true,content:[{type:'text',text:'Browser observation unavailable or outside allowed scope'}]};
+   }
   }
-  if(tools.rdc_browser_status)server.registerTool('rdc_browser_status',{description:'Check prebound test browser session availability (read only)',inputSchema:{},annotations:{readOnlyHint:true}},async()=>gate('rdc_browser_status',async()=>{
-   const x=await backend.status();
-   return {state:x?.state==='ready'?'ready':'unavailable',backend:safeString(x?.backend,40),deviceId};
+  if(tools.rdc_browser_status)server.registerTool('rdc_browser_status',{description:'Check prebound test browser session availability (read only)',inputSchema:{},annotations:{readOnlyHint:true}},async()=>gate('rdc_browser_status',async(signal)=>{
+   const x=await backend.status({signal});
+   return {state:!snapshotUnhealthy&&x?.state==='ready'?'ready':'unavailable',backend:safeString(x?.backend,40),deviceId};
   }));
-  if(tools.rdc_browser_snapshot)server.registerTool('rdc_browser_snapshot',{description:'Observe prebound allowlisted test page accessibility (read only)',inputSchema:{},annotations:{readOnlyHint:true}},async()=>gate('rdc_browser_snapshot',async()=>{
-   if(snapshotBusy)throw new Error('snapshot in progress');
+  if(tools.rdc_browser_snapshot)server.registerTool('rdc_browser_snapshot',{description:'Observe prebound allowlisted test page accessibility (read only)',inputSchema:{},annotations:{readOnlyHint:true}},async()=>gate('rdc_browser_snapshot',async(signal)=>{
+   if(snapshotUnhealthy||snapshotBusy)throw new Error('snapshot unavailable');
    snapshotBusy=true;
-   const operation=Promise.resolve().then(()=>backend.snapshot());
+   const operation=Promise.resolve().then(()=>backend.snapshot({signal}));
    void operation.then(()=>{snapshotBusy=false},()=>{snapshotBusy=false});
    const value=await operation;
    if(!value||!trustedOrigins.has(value.origin))throw new Error('Not allowlisted');
@@ -93,16 +113,45 @@ export async function createBridge({deviceId,token,backend,authorize=()=> 'DENY'
    if(ctype!=='application/json')return errorBody(res,415);
    if(activeRequests>=MAX_ACTIVE_REQUESTS)return errorBody(res,429);
    activeRequests++;
+   const controller=new AbortController();
+   activeControllers.add(controller);
    try{
-   const body=await readJson(req);
-   if(!body||typeof body!=='object'||Array.isArray(body))return errorBody(res,400);
-   const mcp=createMcp();
-   const transport=new StreamableHTTPServerTransport({sessionIdGenerator:undefined});
-   res.once('close',()=>{void transport.close();void mcp.close()});
-   await mcp.connect(transport);
-   await transport.handleRequest(req,res,body);
-   }finally{activeRequests--}
+   let mcp,transport;
+   let cleaned=false;
+   const cleanup=()=>{
+    if(cleaned)return;
+    cleaned=true;
+    controller.abort();
+    void Promise.allSettled([transport?.close(),mcp?.close()]);
+   };
+   res.once('finish',cleanup);
+   res.once('close',cleanup);
+   try{
+    const body=await readJson(req);
+    if(!body||typeof body!=='object'||Array.isArray(body))return errorBody(res,400);
+    mcp=createMcp(controller.signal);
+    transport=new StreamableHTTPServerTransport({sessionIdGenerator:undefined});
+    await mcp.connect(transport);
+    await transport.handleRequest(req,res,body);
+   }finally{
+    cleanup();
+    res.off('finish',cleanup);
+    res.off('close',cleanup);
+   }
+   }finally{
+    controller.abort();
+    activeControllers.delete(controller);
+    activeRequests--;
+   }
   }catch(e){if(!res.writableEnded)errorBody(res,e?.status??400)}
+ });
+ // Bound sockets before complete HTTP headers arrive; partial requests must not bypass admission.
+ listener.maxConnections=MAX_OPEN_SOCKETS;
+ listener.on('connection',socket=>{
+  if(sockets.size>=MAX_OPEN_SOCKETS){socket.destroy();return}
+  sockets.add(socket);
+  socket.once('close',()=>sockets.delete(socket));
+  socket.setTimeout(5000,()=>socket.destroy());
  });
  // Bound incomplete client requests and keep the shutdown path independent of their progress.
  listener.requestTimeout=5000;
@@ -112,9 +161,16 @@ export async function createBridge({deviceId,token,backend,authorize=()=> 'DENY'
   await new Promise((resolve,reject)=>{listener.once('error',reject);listener.listen(0,loopback,resolve)});
   port=listener.address().port;
   const url='http://'+loopback+':'+port+'/mcp';
-  return {url,close:async()=>new Promise((resolve,reject)=>{
-   listener.close(e=>e?reject(e):resolve());
-   listener.closeAllConnections();
-  })};
+  let shutdown;
+  return {url,close:()=>{
+   if(shutdown)return shutdown;
+   shutdown=new Promise((resolve,reject)=>{
+    for(const controller of activeControllers)controller.abort();
+    listener.close(e=>e?reject(e):resolve());
+    for(const socket of sockets)socket.destroy();
+    listener.closeAllConnections();
+   }).finally(()=>backend.dispose?.());
+   return shutdown;
+  }};
  }catch(e){listener.close();throw e}
 }

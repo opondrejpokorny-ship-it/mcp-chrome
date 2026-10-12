@@ -37,3 +37,29 @@ test('snapshot without navigation succeeds',async()=>{
  const backend=createPlaywrightReadOnlyBackend({page,allowedOrigins:[a]});
  assert.deepEqual(await backend.snapshot(),{origin:a,aria:'- text: PRIVATE_TEST_MARKER'});
 });
+
+test('frame navigation fired during the initial origin read denies observation',async()=>{
+ const page=new FakePage();
+ let fired=false;
+ const originalUrl=page.url.bind(page);
+ page.url=()=>{
+  if(!fired){fired=true;page.emit('framenavigated',page.root)}
+  return originalUrl();
+ };
+ const backend=createPlaywrightReadOnlyBackend({page,allowedOrigins:[a]});
+ try{await assert.rejects(backend.snapshot(),/changed|navigation|scope/i)}
+ finally{backend.dispose?.()}
+});
+test('aborting a disposable page snapshot interrupts the underlying browser operation',async()=>{
+ const page=new FakePage();
+ let closed=false;
+ page.isClosed=()=>closed;
+ page.close=async()=>{closed=true;page.emit('close')};
+ page.locator=()=>({ariaSnapshot:()=>new Promise(()=>{})});
+ const backend=createPlaywrightReadOnlyBackend({page,allowedOrigins:[a]});
+ const aborter=new AbortController();
+ const observation=backend.snapshot({signal:aborter.signal});
+ aborter.abort();
+ try{await assert.rejects(Promise.race([observation,new Promise((_,reject)=>setTimeout(()=>reject(Error('abort never interrupted page')),350))]),/cancel|abort|closed/i);assert.equal(closed,true)}
+ finally{backend.dispose?.()}
+});

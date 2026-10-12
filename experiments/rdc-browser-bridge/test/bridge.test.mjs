@@ -136,6 +136,8 @@ test('unresponsive backend operation returns bounded error and does not leak con
   ]);
   assert.equal(timed.isError,true);
   assert.equal(invoked,1);
+  const health=await c.callTool({name:'rdc_browser_status',arguments:{}});
+  assert.equal(JSON.parse(health.content[0].text).state,'unavailable','terminal snapshot timeout must degrade browser status');
   const again=await c.callTool({name:'rdc_browser_snapshot',arguments:{}});
   assert.equal(again.isError,true);
   assert.equal(invoked,1,'stuck operation must not start a second observation');

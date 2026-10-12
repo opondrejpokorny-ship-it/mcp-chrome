@@ -48,6 +48,20 @@ try{
  assert.equal(denied.isError,true);
  assert.doesNotMatch(JSON.stringify(denied),/HIDDEN_MARKER_PILOT/);
  console.log('CROSS_ORIGIN_SNAPSHOT_DENIED_GREEN');
+ // Isolated live Chromium cancellation: a deliberately stalled accessibility read must close its disposable tab.
+ const cancelPage=await browser.newPage();
+ await cancelPage.goto(origin+'/');
+ const cancelBackend=createPlaywrightReadOnlyBackend({page:cancelPage,allowedOrigins:[origin]});
+ const nativeLocator=cancelPage.locator.bind(cancelPage);
+ cancelPage.locator=(selector)=>selector==='body'?{ariaSnapshot:()=>new Promise(()=>{})}:nativeLocator(selector);
+ const stop=new AbortController();
+ const pending=cancelBackend.snapshot({signal:stop.signal});
+ stop.abort();
+ await assert.rejects(pending,/cancel/i);
+ if(!cancelPage.isClosed())await cancelPage.waitForEvent('close',{timeout:1500});
+ assert.equal(cancelPage.isClosed(),true);
+ cancelBackend.dispose();
+ console.log('DISPOSABLE_CHROMIUM_CANCEL_CLOSE_PASS');
  console.log('TOOLS='+tools.join(','));
 }catch(e){console.error('REAL_BROWSER_MCP_RED='+e.stack);process.exitCode=1}
 finally{await client?.close().catch(()=>{});await bridge?.close().catch(()=>{});await browser?.close().catch(()=>{});if(site)await new Promise(r=>site.close(r));if(foreign)await new Promise(r=>foreign.close(r))}
