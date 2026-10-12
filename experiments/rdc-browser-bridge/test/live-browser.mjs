@@ -1,0 +1,43 @@
+import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
+import {randomBytes} from 'node:crypto';
+import path from 'node:path';
+import fs from 'node:fs';
+import {fileURLToPath} from 'node:url';
+const here=path.dirname(fileURLToPath(import.meta.url));
+const pilotBrowsers=path.resolve(here,'../../../../browsers');
+if(fs.existsSync(pilotBrowsers))process.env.PLAYWRIGHT_BROWSERS_PATH=pilotBrowsers;
+const {chromium}=await import('playwright');
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {createBridge} from '../src/server.mjs';
+import {createPlaywrightReadOnlyBackend} from '../src/playwright-backend.mjs';
+let browser,site,bridge,client;
+try{
+ site=createServer((_,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});res.end('<!doctype html><html><body><h1>RDC pilot</h1><button>Safe check</button><input aria-label="Empty test field"></body></html>')});
+ await new Promise(resolve=>site.listen(0,'127.0.0.1',resolve));
+ const origin='http://127.0.0.1:'+site.address().port;
+ browser=await chromium.launch({channel:'chromium',headless:true});
+ const page=await browser.newPage();
+ await page.goto(origin+'/');
+ const token=randomBytes(32).toString('hex');
+ bridge=await createBridge({token,deviceId:'disposable-cube',enabled:{rdc_browser_status:true,rdc_browser_snapshot:true},allowedOrigins:[origin],backend:createPlaywrightReadOnlyBackend({page,allowedOrigins:[origin]}),authorize:({deviceId,tool})=>deviceId==='disposable-cube'&&['rdc_browser_status','rdc_browser_snapshot'].includes(tool)?'ALLOW':'DENY'});
+ client=new Client({name:'real-browser-pilot',version:'1.0.0'});
+ await client.connect(new StreamableHTTPClientTransport(new URL(bridge.url),{requestInit:{headers:{authorization:'Bearer '+token}}}));
+ const tools=(await client.listTools()).tools.map(x=>x.name);
+ assert.deepEqual(tools,['rdc_browser_status','rdc_browser_snapshot']);
+ const status=await client.callTool({name:'rdc_browser_status',arguments:{}});
+ assert.equal(JSON.parse(status.content[0].text).state,'ready');
+ const snap=await client.callTool({name:'rdc_browser_snapshot',arguments:{}});
+ const state=JSON.parse(snap.content[0].text);
+ assert.match(state.aria,/Safe check/);
+ assert.equal(state.origin,origin);
+ console.log('REAL_BROWSER_MCP_STATUS_SNAPSHOT_GREEN');
+ await page.goto('data:text/html,<p>HIDDEN_MARKER_PILOT</p>');
+ const denied=await client.callTool({name:'rdc_browser_snapshot',arguments:{}});
+ assert.equal(denied.isError,true);
+ assert.doesNotMatch(JSON.stringify(denied),/HIDDEN_MARKER_PILOT/);
+ console.log('CROSS_ORIGIN_SNAPSHOT_DENIED_GREEN');
+ console.log('TOOLS='+tools.join(','));
+}catch(e){console.error('REAL_BROWSER_MCP_RED='+e.stack);process.exitCode=1}
+finally{await client?.close().catch(()=>{});await bridge?.close().catch(()=>{});await browser?.close().catch(()=>{});if(site)await new Promise(r=>site.close(r))}

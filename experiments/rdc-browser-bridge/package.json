@@ -1,0 +1,17 @@
+{
+  "name": "rdc-browser-bridge-experiment",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:e2e": "node test/live-browser.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "playwright": "1.64.0"
+  }
+}
