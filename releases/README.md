@@ -4,7 +4,7 @@
 
 ### 1. 下载扩展
 
-下载 [chrome-mcp-server-latest.zip](/releases/chrome-extension/latest/chrome-mcp-server-lastest.zip)
+预构建 ZIP 已从仓库中移除。请从源码构建扩展（参见 `app/chrome-extension/package.json` 中的 `build` / `zip` 脚本），然后按照下面的步骤安装生成的 ZIP。
 
 ### 2. 安装步骤
 
